@@ -174,15 +174,16 @@ criterion = nn.NLLLoss()
 
 # parameters
 learning_rate = 0.0005
-n_iters = 1000000
-print_every = 5000
+n_iters = 100000
+print_every = 1
 plot_every = 50
+hidden_units = 7745
 all_losses = []
 total_loss = 0  # Reset every ``plot_every`` ``iters``
 
 # the network
-rnn = RNN(n_letters, 128, n_letters)
-
+rnn = RNN(n_letters, hidden_units, n_letters)
+print("number of model paraeters: ", sum(p.numel() for p in rnn.parameters()))
 
 def train(category_tensor, input_line_tensor, target_line_tensor):
     target_line_tensor.unsqueeze_(-1)
