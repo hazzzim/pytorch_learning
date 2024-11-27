@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler
+import unicodedata
+import re
+import random
+import numpy as np
 
 # ------------ #
 # hyperparameters
@@ -18,59 +23,133 @@ n_layer = 6
 dropout = 0.0
 # ------------ #
 
-torch.manual_seed(1337)
 # region preprocessing
 SOS_token = 0
 EOS_token = 1
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('../data/transformer/input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
 
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]  # encoder: take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l])  # decoder: take a list of integers, output a string
+class Lang:
+    def __init__(self, name):
+        self.name = name
+        self.word2index = {}
+        self.word2count = {}
+        self.index2word = {0: "SOS", 1: "EOS"}
+        self.n_words = 2  # start with EOS and SOS
 
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9 * len(data))  # first 90% will be trained, rest val
-train_data = data[:n]
-val_data = data[n:]
+    def addSentence(self, sentence):
+        for word in sentence.split(' '):
+            self.addWord(word)
+
+    def addWord(self, word):
+        if word not in self.word2index:
+            self.word2index[word] = self.n_words
+            self.word2count[word] = 1
+            self.index2word[self.n_words] = word
+            self.n_words += 1
+        else:
+            self.word2count[word] += 1
 
 
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i + block_size] for i in ix])
-    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+# Turn a Unicode string to plain ASCII
+def unicodeToAscii(s):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+
+# Lowercase, trim, and remove non-letter characters
+def normalizeString(s):
+    s = unicodeToAscii(s.lower().strip())
+    s = re.sub(r"([.!?])", r" \1", s)
+    s = re.sub(r"[^a-zA-Z!?]+", r" ", s)
+    return s.strip()
+
+
+def readLangs(lang1, lang2, reverse=False):
+    print("Reading lines....")
+
+    # Read the file and split into 2 lines
+    lines = open('../data/data_nlp_classification/%s-%s.txt' % (lang1, lang2), encoding='utf-8'). \
+        read().strip().split('\n')
+
+    # Split every line into pairs
+    pairs = [[normalizeString(s) for s in l.split('\t')] for l in lines]
+
+    # Reverse pairs, make Lang instances
+    if reverse:
+        pairs = [list(reversed(p)) for p in pairs]
+        input_lang = Lang(lang2)
+        output_lang = Lang(lang1)
+    else:
+        input_lang = Lang(lang1)
+        output_lang = Lang(lang2)
+
+    return input_lang, output_lang, pairs
+
+
+MAX_LENGTH = 10
+
+eng_prefixes = (
+    "i am ", "i m ",
+    "he is", "he s ",
+    "she is", "she s ",
+    "you are", "you re ",
+    "we are", "we re ",
+    "they are", "they re "
+)
+
+
+def filterPair(p):
+    return len(p[0].split(' ')) < MAX_LENGTH and \
+        len(p[1].split(' ')) < MAX_LENGTH and \
+        p[1].startswith(eng_prefixes)
+
+
+def filterPairs(pairs):
+    return [pair for pair in pairs if filterPair(pair)]
+
+
+def prepareData(lang1, lang2, reverse=False):
+    input_lang, output_lang, pairs = readLangs(lang1, lang2, reverse)
+    print("Read %s sentence pairs" % len(pairs))
+    pairs = filterPairs(pairs)
+    print("Trimmed to %s sentence pairs" % len(pairs))
+    print("Counting words...")
+
+    for pair in pairs:
+        input_lang.addSentence(pair[0])
+        output_lang.addSentence(pair[1])
+    print("Counted words:")
+    print(input_lang.name, input_lang.n_words)
+    print(output_lang.name, output_lang.n_words)
+    return input_lang, output_lang, pairs
+
+
+input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
+print(random.choice(pairs))
 
 
 # endregion
 
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+
+# @torch.no_grad()
+# def estimate_loss():
+#     out = {}
+#     model.eval()
+#     for split in ['train', 'val']:
+#         losses = torch.zeros(eval_iters)
+#         for k in range(eval_iters):
+#             X, Y = get_batch(split)
+#             logits, loss = model(X, Y)
+#             losses[k] = loss.item()
+#         out[split] = losses.mean()
+#     model.train()
+#     return out
 
 
+# region building the  Model
+# endregion
 class EncodeHead(nn.Module):
     """ one head of encoder self-attention """
 
@@ -241,18 +320,20 @@ class DecoderBlock(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.ln3 = nn.LayerNorm(n_embd)
         self.ln4 = nn.LayerNorm(n_embd)
+        self.ln5 = nn.LayerNorm(n_embd)
 
     def forward(self, x, encoder_output):
         x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         # TODO here try out a single layer norm for both decoder output and encoder output
-        x = x + self.ca(self.ln2(encoder_output), self.ln3(x))
-        x = x + self.ffwd(self.ln4(x))
+        x = x + self.ca(self.ln3(encoder_output), self.ln4(x))
+        x = x + self.ffwd(self.ln5(x))
         return x
 
 
 class TransformerTranslation(nn.Module):
 
-    def __init__(self):
+    def __init__(self, input_vocab_size, output_vocab_size, input_block_size, output_block_size):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.input_token_embedding_table = nn.Embedding(input_vocab_size, n_embd)
@@ -289,7 +370,7 @@ class TransformerTranslation(nn.Module):
             should be the <EOS> and it should be predicted
             """
 
-            sos_tensor = torch.empty(batch_size, 1, device=device).fill_(SOS_token)
+            sos_tensor = torch.empty(batch_size, 1, device=device, dtype=decoder_input.dtype).fill_(SOS_token)
             decoder_input = torch.cat((sos_tensor, decoder_input), dim=1)
 
             decoder_tok_emb = self.output_token_embedding_table(decoder_input)  # (B,T_d,C)
@@ -307,48 +388,87 @@ class TransformerTranslation(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
-            # get the predictions
-            logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :]  # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
-        return idx
+    # def generate(self, idx, max_new_tokens):
+    #     # idx is (B, T) array of indices in the current context
+    #     for _ in range(max_new_tokens):
+    #         # crop idx to the last block_size tokens
+    #         idx_cond = idx[:, -block_size:]
+    #         # get the predictions
+    #         logits, loss = self(idx_cond)
+    #         # focus only on the last time step
+    #         logits = logits[:, -1, :]  # becomes (B, C)
+    #         # apply softmax to get probabilities
+    #         probs = F.softmax(logits, dim=-1)  # (B, C)
+    #         # sample from the distribution
+    #         idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+    #         # append sampled index to the running sequence
+    #         idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+    #     return idx
 
 
-model = TransformerTranslation()
+# region Training
+
+def indexFromSentance(lang, sentance):
+    return [lang.word2index[word] for word in sentance.split(' ')]
+
+
+def tensorFromSentance(lang, sentance):
+    indexes = indexFromSentance(lang, sentance)
+    indexes.append(EOS_token)
+    return torch.tensor(indexes, dtype=torch.long, device=device).view(1, -1)
+
+
+def tensorFromPair(pair):
+    input_tensor = tensorFromSentance(input_lang, pair[0])
+    target_tensor = tensorFromSentance(output_lang, pair[1])
+    return (input_tensor, target_tensor)
+
+
+def get_dataloader(batch_size):
+    input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
+
+    n = len(pairs)
+    input_ids = np.zeros((n, MAX_LENGTH), dtype=np.int32)
+    target_ids = np.zeros((n, MAX_LENGTH), dtype=np.int32)
+
+    for idx, (inp, tgt) in enumerate(pairs):
+        inp_ids = indexFromSentance(input_lang, inp)
+        tgt_ids = indexFromSentance(output_lang, tgt)
+        inp_ids.append(EOS_token)
+        tgt_ids.append(EOS_token)
+
+        input_ids[idx, :len(inp_ids)] = inp_ids
+        target_ids[idx, :len(tgt_ids)] = tgt_ids
+
+    train_data = TensorDataset(torch.LongTensor(input_ids).to(device),
+                               torch.LongTensor(target_ids).to(device))
+
+    train_sampler = RandomSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
+
+    return input_lang, output_lang, train_dataloader
+
+
+def train(model, optimizer, dataloader, epochs: int):
+    for epoch in range(1, epochs + 1):
+        for data in dataloader:
+            input_tensor, target_tensor = data
+            logits, loss = model(input_tensor, target_tensor)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+
+input_lang, output_lang, train_dataloader = get_dataloader(batch_size)
+model = TransformerTranslation(input_lang.n_words, output_lang.n_words, MAX_LENGTH, MAX_LENGTH)
 m = model.to(device)
+
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters()) / 1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-for iter in range(max_iters):
-
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    # sample a batch of data
-    xb, yb = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
+train(model, optimizer, train_dataloader, 1)
 # generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=2000)[0].tolist()))
+# context = torch.zeros((1, 1), dtype=torch.long, device=device)
+# print(decode(m.generate(context, max_new_tokens=2000)[0].tolist()))
