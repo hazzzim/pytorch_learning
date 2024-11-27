@@ -320,14 +320,13 @@ class DecoderBlock(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.ln3 = nn.LayerNorm(n_embd)
         self.ln4 = nn.LayerNorm(n_embd)
-        self.ln5 = nn.LayerNorm(n_embd)
+
 
     def forward(self, x, encoder_output):
         x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
         # TODO here try out a single layer norm for both decoder output and encoder output
-        x = x + self.ca(self.ln3(encoder_output), self.ln4(x))
-        x = x + self.ffwd(self.ln5(x))
+        x = x + self.ca(self.ln2(encoder_output), self.ln3(x))
+        x = x + self.ffwd(self.ln4(x))
         return x
 
 
@@ -343,10 +342,16 @@ class TransformerTranslation(nn.Module):
         self.output_position_embedding_table = nn.Embedding(output_block_size, n_embd)
 
         self.encoder_blocks = nn.Sequential(*[EncoderBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.decoder_blocks = nn.Sequential(*[DecoderBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.decoder_blocks = nn.ModuleList([DecoderBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
 
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, output_vocab_size)
+
+    def run_decoder(self, x, encoder_output):
+        for layer in self.decoder_blocks:
+            x = layer(x, encoder_output)
+        return x
+
 
     def forward(self, idx, targets=None):
         B, T_e = idx.shape
@@ -376,7 +381,7 @@ class TransformerTranslation(nn.Module):
             decoder_tok_emb = self.output_token_embedding_table(decoder_input)  # (B,T_d,C)
             decoder_pos_emb = self.input_position_embedding_table(torch.arange(T_d, device=device))  # (T_d,C)
             decoder_input = decoder_tok_emb + decoder_pos_emb  # (B,T_d,C)
-            decoder_output = self.decoder_blocks(decoder_input, encoder_output)  # (B,T_d,C)
+            decoder_output = self.run_decoder(decoder_input, encoder_output)  # (B,T_d,C)
 
             x = self.ln_f(decoder_output)  # (B,T_d,C)
             logits = self.lm_head(x)  # (B,T_d, output_vocab_size)
@@ -457,6 +462,7 @@ def train(model, optimizer, dataloader, epochs: int):
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            print("one step")
 
 
 input_lang, output_lang, train_dataloader = get_dataloader(batch_size)
