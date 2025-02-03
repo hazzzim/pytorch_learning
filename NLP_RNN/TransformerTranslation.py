@@ -6,21 +6,23 @@ import unicodedata
 import re
 import random
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
 
 # ------------ #
 # hyperparameters
 batch_size = 16  # how many independent sequences will we process in parallel?
 encoder_block_size = 256  # maximum context length for the input
-decoder_block_size = 256  # what is the maximum context length for predictions?
+decoder_block_size = 10  # what is the maximum context length for predictions?
 max_iters = 5
-eval_interval = 100
+eval_interval = 1
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 64
 n_head = 4
 n_layer = 6
-dropout = 0.0
+dropout = 0.2
 # ------------ #
 
 # region preprocessing
@@ -130,22 +132,22 @@ input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
 print(random.choice(pairs))
 
 
-# endregion
-
-
-# @torch.no_grad()
-# def estimate_loss():
-#     out = {}
-#     model.eval()
-#     for split in ['train', 'val']:
-#         losses = torch.zeros(eval_iters)
-#         for k in range(eval_iters):
-#             X, Y = get_batch(split)
-#             logits, loss = model(X, Y)
-#             losses[k] = loss.item()
-#         out[split] = losses.mean()
-#     model.train()
-#     return out
+@torch.no_grad()
+def estimate_loss(train_dataloader, val_dataloader):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            if split == "train":
+                X, Y = next(iter(train_dataloader))
+            else:
+                X, Y = next(iter(val_dataloader))
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
 
 # region building the  Model
@@ -217,8 +219,7 @@ class CrossAttentionHead(nn.Module):
         k = self.key(encoder_output)  # (B,T_encoder,C)
         q = self.query(decoder_output)  # (B,T_decoder,C)
         # compute cross attention scores ("affinities"), here we can use C_e or C_d since they must be the same
-        wei = q @ k.transpose(-2,
-                              -1) * C_d ** -0.5  # (B, T_decoder, C) @ (B, C, T_encoder) -> (B, T_decoder, T_encoder)
+        wei = q @ k.transpose(-2,-1) * C_d ** -0.5 # (B, T_decoder, C) @ (B, C, T_encoder) -> (B, T_decoder, T_encoder)
         wei = F.softmax(wei, dim=-1)  # (B, T_decoder, T_encoder)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -321,7 +322,6 @@ class DecoderBlock(nn.Module):
         self.ln3 = nn.LayerNorm(n_embd)
         self.ln4 = nn.LayerNorm(n_embd)
 
-
     def forward(self, x, encoder_output):
         x = x + self.sa(self.ln1(x))
         # TODO here try out a single layer norm for both decoder output and encoder output
@@ -347,12 +347,25 @@ class TransformerTranslation(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, output_vocab_size)
 
-    def run_decoder(self, x, encoder_output):
+    def run_decoder_layers(self, x, encoder_output):
         for layer in self.decoder_blocks:
             x = layer(x, encoder_output)
         return x
 
+    def run_decoder(self, decoder_input, encoder_output, batch_size, T_d):
 
+        sos_tensor = torch.empty(batch_size, 1, device=device, dtype=decoder_input.dtype).fill_(SOS_token)
+        decoder_input = torch.cat((sos_tensor, decoder_input), dim=1)
+
+        decoder_tok_emb = self.output_token_embedding_table(decoder_input)  # (B,T_d,C)
+        decoder_pos_emb = self.input_position_embedding_table(torch.arange(T_d, device=device))  # (T_d,C)
+        decoder_input = decoder_tok_emb + decoder_pos_emb  # (B,T_d,C)
+        decoder_output = self.run_decoder_layers(decoder_input, encoder_output)  # (B,T_d,C)
+
+        x = self.ln_f(decoder_output)  # (B,T_d,C)
+        logits = self.lm_head(x)  # (B,T_d, output_vocab_size)
+
+        return logits
     def forward(self, idx, targets=None):
         B, T_e = idx.shape
 
@@ -364,6 +377,24 @@ class TransformerTranslation(nn.Module):
 
         if targets is None:
             # TODO add a loop for the SOS as an input until the EOS is reached (break at max length)
+            targets = torch.empty(B, 1, device=device, dtype=idx.dtype).fill_(SOS_token)
+
+            for index in range(MAX_LENGTH):
+                _, T_d = targets.shape
+                decoder_input = targets[:, :-1]
+
+                logits = self.run_decoder(decoder_input, encoder_output, B, T_d)
+                # apply softmax to get probabilities
+                logits = logits[:, -1, :]  # becomes (B, output_vocab_size)
+                # apply softmax to get probabilities
+                probs = F.softmax(logits, dim=-1)  # (B, output_vocab_size)
+                _, idx_next = probs.topk(1)
+                targets = torch.cat((targets, idx_next), dim = 1)
+                if idx_next.item() == EOS_token:
+                    return targets
+            return targets
+
+
             loss = None
         else:
             _, T_d = targets.shape
@@ -375,16 +406,7 @@ class TransformerTranslation(nn.Module):
             should be the <EOS> and it should be predicted
             """
 
-            sos_tensor = torch.empty(batch_size, 1, device=device, dtype=decoder_input.dtype).fill_(SOS_token)
-            decoder_input = torch.cat((sos_tensor, decoder_input), dim=1)
-
-            decoder_tok_emb = self.output_token_embedding_table(decoder_input)  # (B,T_d,C)
-            decoder_pos_emb = self.input_position_embedding_table(torch.arange(T_d, device=device))  # (T_d,C)
-            decoder_input = decoder_tok_emb + decoder_pos_emb  # (B,T_d,C)
-            decoder_output = self.run_decoder(decoder_input, encoder_output)  # (B,T_d,C)
-
-            x = self.ln_f(decoder_output)  # (B,T_d,C)
-            logits = self.lm_head(x)  # (B,T_d, output_vocab_size)
+            logits = self.run_decoder(decoder_input, encoder_output, B, T_d)
 
             B, T_d, C = logits.shape
             logits = logits.view(B * T_d, C)
@@ -429,7 +451,7 @@ def tensorFromPair(pair):
     return (input_tensor, target_tensor)
 
 
-def get_dataloader(batch_size):
+def get_dataloader(batch_size, val_split):
     input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
 
     n = len(pairs)
@@ -445,36 +467,94 @@ def get_dataloader(batch_size):
         input_ids[idx, :len(inp_ids)] = inp_ids
         target_ids[idx, :len(tgt_ids)] = tgt_ids
 
-    train_data = TensorDataset(torch.LongTensor(input_ids).to(device),
-                               torch.LongTensor(target_ids).to(device))
+    data_train, data_val, labels_train, labels_val = train_test_split(input_ids, target_ids, test_size=val_split,
+                                                                      random_state=42)
 
-    train_sampler = RandomSampler(train_data)
+    train_data = TensorDataset(torch.LongTensor(data_train).to(device),
+                               torch.LongTensor(labels_train).to(device))
+
+    val_data = TensorDataset(torch.LongTensor(data_val).to(device),
+                             torch.LongTensor(labels_val).to(device))
+
+    train_sampler = RandomSampler(data_val)
     train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
+    val_dataloader = DataLoader(val_data, sampler=train_sampler, batch_size=batch_size)
 
-    return input_lang, output_lang, train_dataloader
+    return input_lang, output_lang, train_dataloader, val_dataloader
 
 
-def train(model, optimizer, dataloader, epochs: int):
+def train(model, optimizer, dataloader, val_dataloader, epochs: int):
+    val_losses = []
+    train_losses = []
     for epoch in range(1, epochs + 1):
+        if epoch % eval_interval == 0 or epoch == max_iters - 1:
+            losses = estimate_loss(dataloader, val_dataloader)
+            val_losses.append((losses['val']))
+            train_losses.append((losses['train']))
+            print(f"epoch {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         for data in dataloader:
             input_tensor, target_tensor = data
             logits, loss = model(input_tensor, target_tensor)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            print("one step")
+    plt.plot(val_losses, 'g', train_losses, 'r')
+    plt.title("epoch VS loss")
+    plt.show()
+
+def generate(input_lang, output_lang, model, dataloader):
+    with torch.no_grad():
+        model.eval()
+        for data in dataloader:
+            input_tensor, target_tensor = data
+            input_tensor = trim_trailing_zeros(input_tensor[0].unsqueeze(0))
+            output = model(input_tensor[0].unsqueeze(0))
+            break
+
+        input_sentence = decode_tokens(input_lang, input_tensor[0].unsqueeze(0))
+        output_sentence = decode_tokens(output_lang, target_tensor[0].unsqueeze(0))
+        predicted_sentence = decode_tokens(output_lang, output)
+    return input_sentence, output_sentence, predicted_sentence
+
+def decode_tokens (input_lang, input_example):
+    decoded_input = []
+    for idx in input_example.squeeze():
+        decoded_input.append(input_lang.index2word[idx.item()])
+
+    decoded_input= " ".join(decoded_input)
+    return decoded_input
+
+def trim_trailing_zeros(tensor):
+    # Flatten the tensor to handle it as a 1D array
+    flattened = tensor.flatten()
+
+    # Find the index of the last non-zero element
+    non_zero_indices = (flattened != 0).nonzero(as_tuple=True)[0]
+
+    if len(non_zero_indices) == 0:
+        # If all elements are zero, return an empty tensor
+        return torch.tensor([], device=tensor.device)
+
+    last_non_zero_index = non_zero_indices[-1]
+
+    # Slice the tensor up to the last non-zero element
+    trimmed_tensor = flattened[:last_non_zero_index + 1]
+
+    # Reshape the tensor back to its original shape (excluding trailing zeros)
+    return trimmed_tensor.view(1, -1)  # Assuming the original tensor was 2D
 
 
-input_lang, output_lang, train_dataloader = get_dataloader(batch_size)
+
+input_lang, output_lang, train_dataloader, val_dataloader = get_dataloader(batch_size, 0.2)
 model = TransformerTranslation(input_lang.n_words, output_lang.n_words, MAX_LENGTH, MAX_LENGTH)
 m = model.to(device)
-
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters()) / 1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-train(model, optimizer, train_dataloader, 1)
-# generate from the model
-# context = torch.zeros((1, 1), dtype=torch.long, device=device)
-# print(decode(m.generate(context, max_new_tokens=2000)[0].tolist()))
+train(model, optimizer, train_dataloader, val_dataloader, 30)
+input_sentence, output_sentence, predicted_sentence = generate(input_lang, output_lang, model, train_dataloader)
+print(1)
+
+
