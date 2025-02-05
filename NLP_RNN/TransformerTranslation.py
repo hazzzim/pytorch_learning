@@ -91,6 +91,7 @@ def readLangs(lang1, lang2, reverse=False):
 
 
 MAX_LENGTH = 10
+MAX_PREDICT_LENGTH = MAX_LENGTH - 1
 
 eng_prefixes = (
     "i am ", "i m ",
@@ -219,7 +220,8 @@ class CrossAttentionHead(nn.Module):
         k = self.key(encoder_output)  # (B,T_encoder,C)
         q = self.query(decoder_output)  # (B,T_decoder,C)
         # compute cross attention scores ("affinities"), here we can use C_e or C_d since they must be the same
-        wei = q @ k.transpose(-2,-1) * C_d ** -0.5 # (B, T_decoder, C) @ (B, C, T_encoder) -> (B, T_decoder, T_encoder)
+        wei = q @ k.transpose(-2,
+                              -1) * C_d ** -0.5  # (B, T_decoder, C) @ (B, C, T_encoder) -> (B, T_decoder, T_encoder)
         wei = F.softmax(wei, dim=-1)  # (B, T_decoder, T_encoder)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -346,17 +348,21 @@ class TransformerTranslation(nn.Module):
 
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, output_vocab_size)
+        self.input_dtype = torch.int64
 
     def run_decoder_layers(self, x, encoder_output):
         for layer in self.decoder_blocks:
             x = layer(x, encoder_output)
         return x
 
-    def run_decoder(self, decoder_input, encoder_output, batch_size, T_d):
+    def run_decoder(self, decoder_input, encoder_output, batch_size):
 
-        sos_tensor = torch.empty(batch_size, 1, device=device, dtype=decoder_input.dtype).fill_(SOS_token)
-        decoder_input = torch.cat((sos_tensor, decoder_input), dim=1)
-
+        sos_tensor = torch.empty(batch_size, 1, device=device, dtype=self.input_dtype).fill_(SOS_token)
+        if decoder_input == None:
+            decoder_input = sos_tensor
+        else:
+            decoder_input = torch.cat((sos_tensor, decoder_input), dim=1)
+        _, T_d = decoder_input.shape
         decoder_tok_emb = self.output_token_embedding_table(decoder_input)  # (B,T_d,C)
         decoder_pos_emb = self.input_position_embedding_table(torch.arange(T_d, device=device))  # (T_d,C)
         decoder_input = decoder_tok_emb + decoder_pos_emb  # (B,T_d,C)
@@ -366,6 +372,15 @@ class TransformerTranslation(nn.Module):
         logits = self.lm_head(x)  # (B,T_d, output_vocab_size)
 
         return logits
+
+    def postprocess_prediction(self, logits):
+        # apply softmax to get probabilities
+        logits = logits[:, -1, :]  # becomes (B, output_vocab_size)
+        # apply softmax to get probabilities
+        probs = F.softmax(logits, dim=-1)  # (B, output_vocab_size)
+        _, idx_next = probs.topk(1)
+        return idx_next
+
     def forward(self, idx, targets=None):
         B, T_e = idx.shape
 
@@ -376,26 +391,18 @@ class TransformerTranslation(nn.Module):
         encoder_output = self.encoder_blocks(encoder_input)  # (B,T_e,C)
 
         if targets is None:
-            # TODO add a loop for the SOS as an input until the EOS is reached (break at max length)
-            targets = torch.empty(B, 1, device=device, dtype=idx.dtype).fill_(SOS_token)
+            logits = self.run_decoder(decoder_input=None, encoder_output=encoder_output, batch_size=B)
+            targets = self.postprocess_prediction(logits)
 
-            for index in range(MAX_LENGTH):
-                _, T_d = targets.shape
-                decoder_input = targets[:, :-1]
-
-                logits = self.run_decoder(decoder_input, encoder_output, B, T_d)
-                # apply softmax to get probabilities
-                logits = logits[:, -1, :]  # becomes (B, output_vocab_size)
-                # apply softmax to get probabilities
-                probs = F.softmax(logits, dim=-1)  # (B, output_vocab_size)
-                _, idx_next = probs.topk(1)
-                targets = torch.cat((targets, idx_next), dim = 1)
+            for index in range(MAX_PREDICT_LENGTH):
+                logits = self.run_decoder(targets, encoder_output, B)
+                idx_next = self.postprocess_prediction(logits)
+                targets = torch.cat((targets, idx_next), dim=1)
                 if idx_next.item() == EOS_token:
                     return targets
             return targets
 
 
-            loss = None
         else:
             _, T_d = targets.shape
 
@@ -403,10 +410,11 @@ class TransformerTranslation(nn.Module):
 
             """
             Here we have the input for the decoder consisting of (<SOS>, T_d -1) since the last word in the sequence 
-            should be the <EOS> and it should be predicted
+            should usually be the <EOS> and it should be predicted (in this case we have not trimmed the trailing tokens
+            after the <EOS>)
             """
 
-            logits = self.run_decoder(decoder_input, encoder_output, B, T_d)
+            logits = self.run_decoder(decoder_input, encoder_output, B)
 
             B, T_d, C = logits.shape
             logits = logits.view(B * T_d, C)
@@ -414,23 +422,6 @@ class TransformerTranslation(nn.Module):
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
-
-    # def generate(self, idx, max_new_tokens):
-    #     # idx is (B, T) array of indices in the current context
-    #     for _ in range(max_new_tokens):
-    #         # crop idx to the last block_size tokens
-    #         idx_cond = idx[:, -block_size:]
-    #         # get the predictions
-    #         logits, loss = self(idx_cond)
-    #         # focus only on the last time step
-    #         logits = logits[:, -1, :]  # becomes (B, C)
-    #         # apply softmax to get probabilities
-    #         probs = F.softmax(logits, dim=-1)  # (B, C)
-    #         # sample from the distribution
-    #         idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-    #         # append sampled index to the running sequence
-    #         idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
-    #     return idx
 
 
 # region Training
@@ -502,6 +493,7 @@ def train(model, optimizer, dataloader, val_dataloader, epochs: int):
     plt.title("epoch VS loss")
     plt.show()
 
+
 def generate(input_lang, output_lang, model, dataloader):
     with torch.no_grad():
         model.eval()
@@ -516,13 +508,15 @@ def generate(input_lang, output_lang, model, dataloader):
         predicted_sentence = decode_tokens(output_lang, output)
     return input_sentence, output_sentence, predicted_sentence
 
-def decode_tokens (input_lang, input_example):
+
+def decode_tokens(input_lang, input_example):
     decoded_input = []
     for idx in input_example.squeeze():
         decoded_input.append(input_lang.index2word[idx.item()])
 
-    decoded_input= " ".join(decoded_input)
+    decoded_input = " ".join(decoded_input)
     return decoded_input
+
 
 def trim_trailing_zeros(tensor):
     # Flatten the tensor to handle it as a 1D array
@@ -544,17 +538,15 @@ def trim_trailing_zeros(tensor):
     return trimmed_tensor.view(1, -1)  # Assuming the original tensor was 2D
 
 
-
 input_lang, output_lang, train_dataloader, val_dataloader = get_dataloader(batch_size, 0.2)
 model = TransformerTranslation(input_lang.n_words, output_lang.n_words, MAX_LENGTH, MAX_LENGTH)
 m = model.to(device)
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters()) / 1e6, 'M parameters')
+input_sentence, output_sentence, predicted_sentence = generate(input_lang, output_lang, model, train_dataloader)
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 train(model, optimizer, train_dataloader, val_dataloader, 30)
 input_sentence, output_sentence, predicted_sentence = generate(input_lang, output_lang, model, train_dataloader)
 print(1)
-
-
