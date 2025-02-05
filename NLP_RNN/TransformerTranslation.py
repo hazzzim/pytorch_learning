@@ -436,10 +436,7 @@ def tensorFromSentance(lang, sentance):
     return torch.tensor(indexes, dtype=torch.long, device=device).view(1, -1)
 
 
-def tensorFromPair(pair):
-    input_tensor = tensorFromSentance(input_lang, pair[0])
-    target_tensor = tensorFromSentance(output_lang, pair[1])
-    return (input_tensor, target_tensor)
+
 
 
 def get_dataloader(batch_size, val_split):
