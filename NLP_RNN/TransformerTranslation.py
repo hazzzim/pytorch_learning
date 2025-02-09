@@ -12,7 +12,6 @@ from sklearn.model_selection import train_test_split
 # ------------ #
 # hyperparameters
 batch_size = 16  # how many independent sequences will we process in parallel?
-encoder_block_size = 256  # maximum context length for the input
 decoder_block_size = 10  # what is the maximum context length for predictions?
 max_iters = 5
 eval_interval = 1
@@ -21,8 +20,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 64
 n_head = 4
-n_layer = 6
-dropout = 0.2
+n_layer = 2
+dropout = 0.4
 # ------------ #
 
 # region preprocessing
@@ -50,6 +49,30 @@ class Lang:
             self.n_words += 1
         else:
             self.word2count[word] += 1
+
+
+class LanguageDecoder:
+    def __init__(self, input_lang, output_lang):
+        self.input_lang = input_lang
+        self.output_lang = output_lang
+
+    def decode_input_tensor(self, tensor):
+        decoded_input = self.decode_tokens(self.input_lang, tensor)
+
+        return decoded_input
+
+    def decode_output_tensor(self, tensor):
+        decoded_output = self.decode_tokens(self.output_lang, tensor)
+
+        return decoded_output
+
+    def decode_tokens(self, input_lang, input_example):
+        decoded_input = []
+        for idx in input_example.squeeze():
+            decoded_input.append(input_lang.index2word[idx.item()])
+
+        decoded_input = " ".join(decoded_input)
+        return decoded_input
 
 
 # Turn a Unicode string to plain ASCII
@@ -129,12 +152,8 @@ def prepareData(lang1, lang2, reverse=False):
     return input_lang, output_lang, pairs
 
 
-input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
-print(random.choice(pairs))
-
-
 @torch.no_grad()
-def estimate_loss(train_dataloader, val_dataloader):
+def estimate_loss(train_dataloader, val_dataloader, model):
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -186,7 +205,6 @@ class DecodeHead(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(decoder_block_size, decoder_block_size)))
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -355,7 +373,7 @@ class TransformerTranslation(nn.Module):
             x = layer(x, encoder_output)
         return x
 
-    def run_decoder(self, decoder_input, encoder_output, batch_size):
+    def run_decoder(self, encoder_output, batch_size, decoder_input=None):
 
         sos_tensor = torch.empty(batch_size, 1, device=device, dtype=self.input_dtype).fill_(SOS_token)
         if decoder_input == None:
@@ -391,11 +409,11 @@ class TransformerTranslation(nn.Module):
         encoder_output = self.encoder_blocks(encoder_input)  # (B,T_e,C)
 
         if targets is None:
-            logits = self.run_decoder(decoder_input=None, encoder_output=encoder_output, batch_size=B)
+            logits = self.run_decoder(encoder_output, B)
             targets = self.postprocess_prediction(logits)
 
             for index in range(MAX_PREDICT_LENGTH):
-                logits = self.run_decoder(targets, encoder_output, B)
+                logits = self.run_decoder(encoder_output, B, targets)
                 idx_next = self.postprocess_prediction(logits)
                 targets = torch.cat((targets, idx_next), dim=1)
                 if idx_next.item() == EOS_token:
@@ -436,9 +454,6 @@ def tensorFromSentance(lang, sentance):
     return torch.tensor(indexes, dtype=torch.long, device=device).view(1, -1)
 
 
-
-
-
 def get_dataloader(batch_size, val_split):
     input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
 
@@ -476,7 +491,7 @@ def train(model, optimizer, dataloader, val_dataloader, epochs: int):
     train_losses = []
     for epoch in range(1, epochs + 1):
         if epoch % eval_interval == 0 or epoch == max_iters - 1:
-            losses = estimate_loss(dataloader, val_dataloader)
+            losses = estimate_loss(dataloader, val_dataloader, model)
             val_losses.append((losses['val']))
             train_losses.append((losses['train']))
             print(f"epoch {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -491,28 +506,24 @@ def train(model, optimizer, dataloader, val_dataloader, epochs: int):
     plt.show()
 
 
-def generate(input_lang, output_lang, model, dataloader):
+def generate_random(model, dataloader, samples, decoder):
     with torch.no_grad():
         model.eval()
-        for data in dataloader:
-            input_tensor, target_tensor = data
-            input_tensor = trim_trailing_zeros(input_tensor[0].unsqueeze(0))
-            output = model(input_tensor[0].unsqueeze(0))
-            break
+        for sample in range(samples):
+            input_tensor, output_tensor = random.choice(dataloader.dataset)
+            input_tensor = trim_trailing_zeros(input_tensor)
+            predicted_tensor = model(input_tensor)
 
-        input_sentence = decode_tokens(input_lang, input_tensor[0].unsqueeze(0))
-        output_sentence = decode_tokens(output_lang, target_tensor[0].unsqueeze(0))
-        predicted_sentence = decode_tokens(output_lang, output)
-    return input_sentence, output_sentence, predicted_sentence
+            input_sentence = decoder.decode_input_tensor(input_tensor)
+            output_sentence = decoder.decode_output_tensor(output_tensor)
+            predicted_sentence = decoder.decode_output_tensor(predicted_tensor)
 
-
-def decode_tokens(input_lang, input_example):
-    decoded_input = []
-    for idx in input_example.squeeze():
-        decoded_input.append(input_lang.index2word[idx.item()])
-
-    decoded_input = " ".join(decoded_input)
-    return decoded_input
+            print(f"<-----------------------{sample}------------------------>")
+            print("input sentence: ", input_sentence)
+            print("output sentence:", output_sentence)
+            print("predicted sentence:", predicted_sentence)
+            print("<------------------------------------------------>")
+        model.train()
 
 
 def trim_trailing_zeros(tensor):
@@ -532,18 +543,21 @@ def trim_trailing_zeros(tensor):
     trimmed_tensor = flattened[:last_non_zero_index + 1]
 
     # Reshape the tensor back to its original shape (excluding trailing zeros)
-    return trimmed_tensor.view(1, -1)  # Assuming the original tensor was 2D
+    return trimmed_tensor.view(1, -1)  # the original tensor is 2D
 
 
-input_lang, output_lang, train_dataloader, val_dataloader = get_dataloader(batch_size, 0.2)
-model = TransformerTranslation(input_lang.n_words, output_lang.n_words, MAX_LENGTH, MAX_LENGTH)
-m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters()) / 1e6, 'M parameters')
-input_sentence, output_sentence, predicted_sentence = generate(input_lang, output_lang, model, train_dataloader)
+if __name__ == "__main__":
+    input_lang, output_lang, train_dataloader, val_dataloader = get_dataloader(batch_size, 0.2)
+    translation_model = TransformerTranslation(input_lang.n_words, output_lang.n_words, MAX_LENGTH, MAX_LENGTH)
+    language_decoder = LanguageDecoder(input_lang, output_lang)
+    translation_model.to(device)
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-train(model, optimizer, train_dataloader, val_dataloader, 30)
-input_sentence, output_sentence, predicted_sentence = generate(input_lang, output_lang, model, train_dataloader)
-print(1)
+    # create a PyTorch optimizer
+    optimizer = torch.optim.AdamW(translation_model.parameters(), lr=learning_rate)
+    # train the model or load existing
+    translation_model.load_state_dict(torch.load('saved_models/transformer_translator_model_v1.pth'))
+    # train(translation_model, optimizer, train_dataloader, val_dataloader, 15)
+    # torch.save(translation_model.state_dict(), "saved_models/transformer_translator_model_v1.pth")
+
+    generate_random(translation_model, train_dataloader, 20, language_decoder)
+    print(1)
