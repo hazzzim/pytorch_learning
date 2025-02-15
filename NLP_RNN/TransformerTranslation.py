@@ -73,7 +73,8 @@ class Lang:
 
 class LanguageDecoder:
     """
-    A class to decode tensors back into human-readable sentences."""
+    A class to decode tensors back into human-readable sentences.
+    """
 
     def __init__(self, input_lang, output_lang):
         """Initialize the decoder.
@@ -359,8 +360,7 @@ class DecodeHead(nn.Module):
 
 
 class CrossAttentionHead(nn.Module):
-    """
-    One head of cross-attention."""
+    """One head of cross-attention."""
 
     def __init__(self, head_size):
         """
@@ -758,7 +758,7 @@ class TransformerTranslation(nn.Module):
             # Training mode
             _, T_d = targets.shape
             decoder_input = targets[:, :-1]  # Exclude the last token for teacher forcing
-            logits = self.run_decoder(decoder_input, encoder_output, B)
+            logits = self.run_decoder(encoder_output, B, decoder_input)
             B, T_d, C = logits.shape
             logits = logits.view(B * T_d, C)
             targets = targets.view(B * T_d)
@@ -913,8 +913,8 @@ if __name__ == "__main__":
     # create a PyTorch optimizer
     optimizer = torch.optim.AdamW(translation_model.parameters(), lr=learning_rate)
     # train the model or load existing
-    translation_model.load_state_dict(torch.load('saved_models/transformer_translator_model_v1.pth'))
-    # train(translation_model, optimizer, train_dataloader, val_dataloader, 15)
+    #translation_model.load_state_dict(torch.load('saved_models/transformer_translator_model_v1.pth'))
+    train(translation_model, optimizer, train_dataloader, val_dataloader, 15)
     # torch.save(translation_model.state_dict(), "saved_models/transformer_translator_m
     generate_random(translation_model, train_dataloader, 20, language_decoder)
     print(1)
